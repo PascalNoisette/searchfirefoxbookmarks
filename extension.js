@@ -22,6 +22,7 @@ const Lang = imports.lang;
 const Shell = imports.gi.Shell;
 const Util = imports.misc.util;
 const St = imports.gi.St;
+const Gda = imports.gi.Gda;
 
 // Settings
 
@@ -38,6 +39,9 @@ const FirefoxBookmarksSearchProvider = new Lang.Class({
     
     _init: function(title) {
         this.title = title;
+        this._configBookmarks = {};
+        this._favicon = {};
+        this._bookmarkFileMonitor = false;
 
         // Retrieve environment variables
         this.FirefoxBookmarkBackupsDir = GLib.getenv("FIREFOX_BOOKMARK_BACKUPS_DIR");
@@ -74,9 +78,19 @@ const FirefoxBookmarksSearchProvider = new Lang.Class({
                     this._getBookmarkFilePath(mozillaDefaultDirPath))) {
                 return false;
             }
-        }
 
-        this._configBookmarks = {};
+            if (this.bookmarkFilePath.match(/jsonlz4$/) != null) {
+                
+        
+                mozillaDefaultDirPath = GLib.build_filenamev([
+                    GLib.get_home_dir(), ".mozilla/firefox/",
+                    defaultProfile
+                ]);
+                
+                this._openPlace(mozillaDefaultDirPath);
+                return true;
+            }
+        }
 
         this._readBookmarks();
 
@@ -246,16 +260,31 @@ const FirefoxBookmarksSearchProvider = new Lang.Class({
     getResultMeta: function (id) {
         let bookmark_name = "";
         let name = this._configBookmarks[id][0];
-        let url = this._configBookmarks[id][1]; 
+        let url = this._configBookmarks[id][1];
+        let hostname = this._extractHostname(url);
         if (name.trim())
             bookmark_name = name;
         else
             bookmark_name = url;
 
+        let preview_image_url = false;
+        if (typeof (this._configBookmarks[id][2]) != "undefined" && this._configBookmarks[id][2]) {
+            preview_image_url = this._configBookmarks[id][2];
+        } else if (typeof (this._favicon[hostname]) != "undefined") {
+            preview_image_url = this._favicon[hostname];
+        }
+
         let createIcon;
         if (firefoxApp) {
             createIcon = function (size) {
                 return firefoxApp.create_icon_texture(size);
+            };
+        } else if (preview_image_url) {
+            createIcon = function (size) {
+                return icon = new St.Icon({
+                    gicon: Gio.icon_new_for_string(preview_image_url),
+                    icon_size: size
+                });
             };
         } else {
             createIcon = function (size) {
@@ -329,6 +358,76 @@ const FirefoxBookmarksSearchProvider = new Lang.Class({
         });
         return searchResults.map(function(it) { return it.id });
     },
+    _openPlace : function (profilePath) {
+        
+        this._sqlQuery(
+            "DB_DIR=" + profilePath + ";DB_NAME=places.sqlite",
+            "SELECT      moz_places.id,                                        \
+                         COALESCE(moz_places.title, moz_bookmarks.title , ''), \
+                         url,                                                  \
+                         COALESCE(preview_image_url, '')                       \
+             FROM        moz_places                                            \
+             INNER JOIN  moz_bookmarks                                         \
+             ON          moz_bookmarks.fk=moz_places.id                        \
+             WHERE       url like 'http%' ;",
+            Lang.bind(this, function(iter) {
+                this._configBookmarks[iter.get_value_at (0)] = [
+                    Gda.value_stringify (iter.get_value_at (1)),
+                    Gda.value_stringify (iter.get_value_at (2)),
+                    Gda.value_stringify (iter.get_value_at (3))
+                ];
+            })
+        );
+        this._sqlQuery(
+            "DB_DIR=" + profilePath + ";DB_NAME=favicons.sqlite",
+            "SELECT   icon_url  \
+             FROM     moz_icons \
+             GROUP BY icon_url;",
+             Lang.bind(this, function(iter) {
+                this._favicon[this._extractHostname(Gda.value_stringify (iter.get_value_at (0)))] = Gda.value_stringify (iter.get_value_at (0));
+             })
+        );
+    },
+
+    _sqlQuery : function (dbstring, query, callback) {
+        this.connection = new Gda.Connection (
+            {
+                provider: Gda.Config.get_provider("SQLite"),
+                cnc_string:dbstring
+            }
+        );
+        
+        try {
+            this.connection.open();
+            var dm = this.connection.execute_select_command (query);
+            var iter = dm.create_iter ();
+            while (iter.move_next ()) {
+                callback(iter);
+            }
+            this.connection.close ();
+        } catch (e) {
+            Main.notifyError("Error query bookmark database", e.message);
+        }
+    },
+
+    _extractHostname : function (url) {
+        var hostname;
+        //find & remove protocol (http, ftp, etc.) and get hostname
+    
+        if (url.indexOf("//") > -1) {
+            hostname = url.split('/')[2];
+        }
+        else {
+            hostname = url.split('/')[0];
+        }
+    
+        //find & remove port number
+        hostname = hostname.split(':')[0];
+        //find & remove "?"
+        hostname = hostname.split('?')[0];
+    
+        return hostname;
+    },
 
     getInitialResultSet: function (terms, callback, cancelable) {
         // check if a found host-name begins like the search-term
@@ -345,7 +444,10 @@ const FirefoxBookmarksSearchProvider = new Lang.Class({
         return null;
     },
     destroy: function () {
-        this._bookmarkFileMonitor.cancel();
+        if (this._bookmarkFileMonitor) {
+            this._bookmarkFileMonitor.cancel();
+        }
+        this._favicon = {};
         this._configBookmarks = {};
     }
 });
